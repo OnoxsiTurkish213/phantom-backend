@@ -449,5 +449,130 @@ setInterval(async () => {
   }
 }, 10 * 60 * 1000);
 
+
+// ── Ekstra Endpoint'ler (Hesap Ayarları) ───────────────────────
+
+// Şifre değiştir
+app.post('/auth/change-password', async (req, res) => {
+  try {
+    const { userId, oldPassword, newPassword } = req.body;
+    if (!userId || !oldPassword || !newPassword)
+      return res.status(400).json({ error: 'Eksik alan' });
+    if (newPassword.length < 6)
+      return res.status(400).json({ error: 'Yeni sifre en az 6 karakter olmali' });
+
+    const snap = await db().collection('users').doc(userId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Kullanici bulunamadi' });
+
+    const user = snap.data();
+    if (user.passwordHash !== hashPassword(oldPassword))
+      return res.status(401).json({ error: 'Mevcut sifre yanlis' });
+
+    await db().collection('users').doc(userId).update({
+      passwordHash: hashPassword(newPassword),
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Sunucu hatasi' });
+  }
+});
+
+// Kullanıcı adı değiştir (7 günde bir)
+app.post('/auth/change-username', async (req, res) => {
+  try {
+    const { userId, newUsername } = req.body;
+    if (!userId || !newUsername)
+      return res.status(400).json({ error: 'Eksik alan' });
+    if (newUsername.length < 3 || newUsername.length > 20)
+      return res.status(400).json({ error: 'Kullanici adi 3-20 karakter olmali' });
+
+    const snap = await db().collection('users').doc(userId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Kullanici bulunamadi' });
+
+    const user = snap.data();
+
+    // 7 gün kontrolü
+    if (user.lastUsernameChange) {
+      const diff = Date.now() - user.lastUsernameChange;
+      const days = diff / (1000 * 60 * 60 * 24);
+      if (days < 7) {
+        const remaining = Math.ceil(7 - days);
+        return res.status(400).json({ error: `Kullanici adini ${remaining} gun sonra degistirebilirsin` });
+      }
+    }
+
+    // Alınmış mı?
+    const existing = await db().collection('users')
+      .where('username', '==', newUsername.toLowerCase())
+      .get();
+    if (!existing.empty) return res.status(409).json({ error: 'Bu kullanici adi alinmis' });
+
+    await db().collection('users').doc(userId).update({
+      username:           newUsername.toLowerCase(),
+      displayName:        newUsername,
+      lastUsernameChange: Date.now(),
+    });
+
+    res.json({ success: true, username: newUsername.toLowerCase() });
+  } catch (e) {
+    res.status(500).json({ error: 'Sunucu hatasi' });
+  }
+});
+
+// Hesap sil
+app.delete('/auth/delete-account', async (req, res) => {
+  try {
+    const { userId, password } = req.body;
+    if (!userId || !password)
+      return res.status(400).json({ error: 'Eksik alan' });
+
+    const snap = await db().collection('users').doc(userId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Kullanici bulunamadi' });
+
+    const user = snap.data();
+    if (user.passwordHash !== hashPassword(password))
+      return res.status(401).json({ error: 'Sifre yanlis' });
+
+    const batch = db().batch();
+
+    // Kullanıcıyı sil
+    batch.delete(db().collection('users').doc(userId));
+
+    // Mesajlarını sil
+    const msgs = await db().collection('messages')
+      .where('from', '==', userId).get();
+    msgs.docs.forEach(d => batch.delete(d.ref));
+
+    const msgsTo = await db().collection('messages')
+      .where('to', '==', userId).get();
+    msgsTo.docs.forEach(d => batch.delete(d.ref));
+
+    // İsteklerini sil
+    const reqs = await db().collection('requests')
+      .where('from', '==', userId).get();
+    reqs.docs.forEach(d => batch.delete(d.ref));
+
+    const reqsTo = await db().collection('requests')
+      .where('to', '==', userId).get();
+    reqsTo.docs.forEach(d => batch.delete(d.ref));
+
+    await batch.commit();
+
+    // Socket'i kapat
+    const socketId = onlineUsers.get(userId);
+    if (socketId) {
+      io.sockets.sockets.get(socketId)?.disconnect();
+      onlineUsers.delete(userId);
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('delete-account error:', e);
+    res.status(500).json({ error: 'Sunucu hatasi' });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Phantom backend çalışıyor → port ${PORT}`));
